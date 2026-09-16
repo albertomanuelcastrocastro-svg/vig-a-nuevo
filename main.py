@@ -23,7 +23,8 @@ import json
 import statistics
 from datetime import datetime, timezone
 
-import requests
+import urllib.request
+import urllib.parse
 
 # ─────────────────────────────────────────────────────────────────────
 # AJUSTES — todo esto se puede cambiar desde las variables de Railway
@@ -70,19 +71,27 @@ def log(msg):
     print(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
+def pedir(url, params=None, datos=None, timeout=25):
+    """Petición HTTP con lo que trae Python de serie. Sin librerías extra."""
+    if params:
+        url = url + "?" + urllib.parse.urlencode(params)
+    cuerpo = json.dumps(datos).encode() if datos is not None else None
+    req = urllib.request.Request(
+        url, data=cuerpo,
+        headers={"Content-Type": "application/json", "User-Agent": "vigia-zonas/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
 def telegram(texto):
     """Manda el aviso al móvil de Charlie."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log(f"(sin Telegram configurado) {texto}")
         return
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": texto},
-            timeout=15,
-        )
-        if r.status_code != 200:
-            log(f"Telegram respondió {r.status_code}: {r.text[:200]}")
+        pedir(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+              datos={"chat_id": TELEGRAM_CHAT_ID, "text": texto}, timeout=15)
     except Exception as e:
         log(f"Error mandando Telegram: {e}")
 
@@ -111,9 +120,7 @@ def traer_velas(simbolo, intervalo="1h", total=2000):
                   "limit": min(1000, total - len(velas))}
         if fin:
             params["endTime"] = fin
-        r = requests.get(f"{BINANCE}/api/v3/klines", params=params, timeout=25)
-        r.raise_for_status()
-        lote = r.json()
+        lote = pedir(f"{BINANCE}/api/v3/klines", params=params)
         if not lote:
             break
         velas = lote + velas
@@ -135,10 +142,8 @@ def traer_velas(simbolo, intervalo="1h", total=2000):
 
 
 def precio_actual(simbolo):
-    r = requests.get(f"{BINANCE}/api/v3/ticker/price",
-                     params={"symbol": simbolo}, timeout=15)
-    r.raise_for_status()
-    return float(r.json()["price"])
+    d = pedir(f"{BINANCE}/api/v3/ticker/price", params={"symbol": simbolo}, timeout=15)
+    return float(d["price"])
 
 
 # ─────────────────────────────────────────────────────────────────────
