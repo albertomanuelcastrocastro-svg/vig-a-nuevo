@@ -1,131 +1,625 @@
-/*** ─────────────────────────────────────────────────────────────
-     REGISTRO DE SEÑALES — recibe los avisos del Vigía de Zonas
-     y los escribe en la pestaña SEÑALES de PANORAMA · DAVID.
- 
-     El bot manda un JSON por POST. Aquí se guarda dos veces:
-       · desmenuzado en columnas, para poder filtrar y sacar medias
-       · entero en la última columna, por si algún día hace falta algo
-         que hoy no se nos ha ocurrido
- 
-     Si llega una señal con un id que ya existe (porque el bot manda
-     el seguimiento de +1h, +4h y +24h), NO duplica: actualiza la fila.
- 
-     CÓMO PUBLICARLO (una sola vez):
-       1. Extensiones → Apps Script, pegar esto en un archivo nuevo.
-       2. Implementar → Nueva implementación → tipo "Aplicación web".
-       3. Ejecutar como: Yo.  Quién tiene acceso: Cualquier usuario.
-       4. Copiar la URL que da (termina en /exec) y meterla en Railway
-          como variable REGISTRO_URL del servicio vig-a-nuevo.
-     ───────────────────────────────────────────────────────────── ***/
- 
-const HOJA_SENALES = 'SEÑALES';
- 
-const CABECERA = [
-  'fecha_hora', 'id', 'activo', 'tipo', 'sentido', 'papel_previo',
-  'precio_senal', 'zona_centro', 'zona_ancho', 'fuerza', 'umbral',
-  'toques', 'toques_techo', 'toques_suelo', 'dominio_compra', 'atr',
-  'vela_color', 'vela_cuerpo_pct', 'vela_vol_relativo', 'vela_dom_comprador',
-  'tramo_verdes', 'tramo_rojas',
-  'mas_1h', 'mas_1h_pct', 'mas_4h', 'mas_4h_pct', 'mas_24h', 'mas_24h_pct',
-  'mensaje', 'json'
-];
- 
-function doPost(e) {
-  try {
-    const reg = JSON.parse(e.postData.contents);
-    guardarSenal_(reg);
-    return ContentService
-      .createTextOutput(JSON.stringify({ ok: true, id: reg.id }))
-      .setMimeType(ContentService.MimeType.JSON);
-  } catch (err) {
-    return ContentService
-      .createTextOutput(JSON.stringify({ ok: false, error: String(err) }))
-      .setMimeType(ContentService.MimeType.JSON);
-  }
-}
- 
-function guardarSenal_(reg) {
-  const sh = getSenales_();
-  const fila = filaDe_(reg);
- 
-  // ¿ya existe esa señal? (columna B = id)
-  const ids = sh.getRange(2, 2, Math.max(sh.getLastRow() - 1, 1), 1).getValues();
-  let destino = -1;
-  for (let i = 0; i < ids.length; i++) {
-    if (String(ids[i][0]) === String(reg.id)) { destino = i + 2; break; }
-  }
- 
-  if (destino > 0) {
-    sh.getRange(destino, 1, 1, fila.length).setValues([fila]);
-  } else {
-    sh.appendRow(fila);
-  }
-}
- 
-function filaDe_(reg) {
-  const z = reg.zona || {};
-  const v = reg.vela_senal || reg['vela_señal'] || {};
-  const tr = reg.tramo_espera || {};
-  const s = reg.seguimiento || {};
- 
-  function seg(clave, campo) {
-    return (s[clave] && s[clave][campo] !== undefined) ? s[clave][campo] : '';
-  }
- 
-  return [
-    reg.hora_utc || '',
-    reg.id || '',
-    reg.activo || '',
-    reg.tipo || '',
-    reg.sentido || '',
-    reg.papel_previo || '',
-    num_(reg.precio_senal !== undefined ? reg.precio_senal : reg['precio_señal']),
-    num_(z.centro), num_(z.ancho), num_(z.fuerza), num_(z.umbral_aplicado),
-    num_(z.toques), num_(z.toques_techo), num_(z.toques_suelo),
-    num_(z.dominio_compra), num_(z.atr),
-    v.color || '',
-    num_(v.cuerpo_pct_rango), num_(v.volumen_relativo), num_(v.dominio_comprador),
-    num_(tr.verdes), num_(tr.rojas),
-    num_(seg('mas_1h', 'precio')), num_(seg('mas_1h', 'variacion_pct')),
-    num_(seg('mas_4h', 'precio')), num_(seg('mas_4h', 'variacion_pct')),
-    num_(seg('mas_24h', 'precio')), num_(seg('mas_24h', 'variacion_pct')),
-    reg.mensaje || '',
-    JSON.stringify(reg)
-  ];
-}
- 
-function getSenales_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let s = ss.getSheetByName(HOJA_SENALES);
-  if (!s) {
-    s = ss.insertSheet(HOJA_SENALES);
-    s.appendRow(CABECERA);
-    s.setFrozenRows(1);
-  }
-  return s;
-}
- 
-function num_(v) {
-  if (v === null || v === undefined || v === '') return '';
-  const n = Number(v);
-  return isNaN(n) ? '' : n;
-}
- 
-/*** Prueba de mesa: ejecutar a mano una vez tras publicar,
-     para comprobar que crea la pestaña y escribe bien. ***/
-function probarRegistro() {
-  guardarSenal_({
-    id: 'PRUEBA-1', hora_utc: '2026-09-18T12:00:00Z', activo: 'XRP',
-    tipo: 'rebote', sentido: 'alcista', papel_previo: 'soporte',
-    'precio_señal': 1.3195,
-    zona: { centro: 1.3150, ancho: 0.004, fuerza: 24.5, umbral_aplicado: 8,
-            toques: 13, toques_techo: 5, toques_suelo: 8,
-            dominio_compra: 0.57, atr: 0.016 },
-    'vela_señal': { color: 'verde', cuerpo_pct_rango: 0.62,
-                    volumen_relativo: 2.1, dominio_comprador: 0.61 },
-    tramo_espera: { verdes: 2, rojas: 1 },
-    mensaje: 'PRUEBA — borrar esta fila',
-    seguimiento: {}
-  });
-  Logger.log('Escrita la fila de prueba en ' + HOJA_SENALES);
-}
+"""
+VIGÍA DE ZONAS — Charlie / PANORAMA·DAVID
+==========================================
+Vigila XRP (y Solana) contra las zonas donde el precio se ha dado la vuelta
+de verdad, y avisa por Telegram cuando las toca.
+
+Principios (de Charlie):
+  · Son ZONAS, no líneas. Su anchura se calcula con el ATR, así se ajusta sola.
+  · Lo que da peso a un toque NO es la distancia recorrida: es el VOLUMEN.
+    Un toque con volumen fuerte es donde alguien defendió de verdad.
+  · Una zona rota cambia de papel: la resistencia pasa a ser soporte.
+  · Cuando toca, NO avisa de inmediato: espera a ver la reacción y entonces
+    dice si rebotó o si la cruzó.
+
+No decide nada. Solo avisa para que Charlie abra la gráfica y mire.
+
+REGISTRO (v2, 18-sep-2026)
+  Cada señal se guarda como un JSON completo: hora, zona, toques, fuerza,
+  la vela que provocó el aviso (cuerpo, mechas, volumen, quién mandaba) y
+  el seguimiento del precio a +1h, +4h y +24h. Con eso se puede medir de
+  verdad si los avisos aciertan.
+  Sale por dos sitios: una línea JSON en el log, y un POST a la hoja si
+  REGISTRO_URL está configurada.
+
+Datos: API pública de Binance. Gratis, sin clave, tiempo real.
+"""
+
+import os
+import time
+import json
+import statistics
+from datetime import datetime, timezone
+
+import urllib.request
+import urllib.parse
+
+# ─────────────────────────────────────────────────────────────────────
+# AJUSTES — todo esto se puede cambiar desde las variables de Railway
+# ─────────────────────────────────────────────────────────────────────
+
+SIMBOLOS = os.getenv("SIMBOLOS", "XRPUSDT,SOLUSDT").split(",")
+
+# Cada cuánto mira el precio (segundos)
+INTERVALO_SEGUNDOS = int(os.getenv("INTERVALO_SEGUNDOS", "60"))
+
+# Cuánto espera, tras tocar una zona, antes de juzgar la reacción (minutos)
+ESPERA_MINUTOS = int(os.getenv("ESPERA_MINUTOS", "15"))
+
+# Anchura de la zona, en fracción de ATR (0.25 = un cuarto de ATR a cada lado)
+ANCHO_ZONA_ATR = float(os.getenv("ANCHO_ZONA_ATR", "0.25"))
+
+# Cuánto recorrido (en ATR) hace falta para considerar que hubo un giro
+GIRO_MINIMO_ATR = float(os.getenv("GIRO_MINIMO_ATR", "1.0"))
+
+# Fuerza mínima de una zona para que merezca un aviso.
+# La fuerza es la suma de los toques PESADOS POR VOLUMEN.
+# Se puede poner distinta por activo:  UMBRAL_XRPUSDT=8  UMBRAL_SOLUSDT=20
+UMBRAL_FUERZA = float(os.getenv("UMBRAL_FUERZA", "3.0"))
+
+# Tras avisar de una zona, cuántas horas se calla sobre esa misma zona
+SILENCIO_HORAS = float(os.getenv("SILENCIO_HORAS", "4"))
+
+# Cada cuántas horas recalcula las zonas desde cero
+RECALCULO_HORAS = float(os.getenv("RECALCULO_HORAS", "12"))
+
+# Vida media de un toque, en días: uno de hace 30 días pesa la mitad
+VIDA_MEDIA_DIAS = float(os.getenv("VIDA_MEDIA_DIAS", "30"))
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# ── registro de señales ──
+# URL de la app web de Apps Script que escribe en la pestaña SEÑALES.
+# Si se deja vacía, el registro solo sale por el log.
+REGISTRO_URL = os.getenv("REGISTRO_URL", "")
+
+# Vela fina que se usa para radiografiar el momento de la señal
+VELA_REGISTRO = os.getenv("VELA_REGISTRO", "5m")
+
+# Horas a las que se mira qué pasó después de cada señal
+SEGUIMIENTOS_H = [float(x) for x in os.getenv("SEGUIMIENTOS_H", "1,4,24").split(",")]
+
+BINANCE = "https://api.binance.com"
+
+
+def umbral_de(simbolo):
+    """Umbral de fuerza propio de cada activo, si se ha puesto uno."""
+    return float(os.getenv(f"UMBRAL_{simbolo}", UMBRAL_FUERZA))
+
+
+# ─────────────────────────────────────────────────────────────────────
+# UTILIDADES
+# ─────────────────────────────────────────────────────────────────────
+
+def log(msg):
+    print(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+
+
+def iso(ts):
+    """Segundos epoch -> texto ISO en UTC."""
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def pedir(url, params=None, datos=None, timeout=25):
+    """Petición HTTP con lo que trae Python de serie. Sin librerías extra."""
+    if params:
+        url = url + "?" + urllib.parse.urlencode(params)
+    cuerpo = json.dumps(datos).encode() if datos is not None else None
+    req = urllib.request.Request(
+        url, data=cuerpo,
+        headers={"Content-Type": "application/json", "User-Agent": "vigia-zonas/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def telegram(texto):
+    """Manda el aviso al móvil de Charlie."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log(f"(sin Telegram configurado) {texto}")
+        return
+    try:
+        pedir(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+              datos={"chat_id": TELEGRAM_CHAT_ID, "text": texto}, timeout=15)
+    except Exception as e:
+        log(f"Error mandando Telegram: {e}")
+
+
+def fmt(x, simbolo):
+    """Formatea el precio con los decimales que tocan y coma decimal."""
+    dec = 4 if x < 10 else 2
+    return f"{x:.{dec}f}".replace(".", ",")
+
+
+def r6(x):
+    return None if x is None else round(float(x), 6)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# DATOS — velas de Binance (gratis, con volumen)
+# ─────────────────────────────────────────────────────────────────────
+
+def traer_velas(simbolo, intervalo="1h", total=2000):
+    """
+    Descarga velas históricas. Binance da 1000 por llamada, así que
+    encadena varias hacia atrás hasta juntar las que pidamos.
+    Cada vela: apertura, máximo, mínimo, cierre, volumen, nº operaciones,
+    y volumen del comprador agresivo (para saber quién mandaba).
+    """
+    velas = []
+    fin = None
+    while len(velas) < total:
+        params = {"symbol": simbolo, "interval": intervalo,
+                  "limit": min(1000, total - len(velas))}
+        if fin:
+            params["endTime"] = fin
+        lote = pedir(f"{BINANCE}/api/v3/klines", params=params)
+        if not lote:
+            break
+        velas = lote + velas
+        fin = lote[0][0] - 1
+        if len(lote) < params["limit"]:
+            break
+        time.sleep(0.25)   # no atosigar la API
+
+    return [{
+        "t":      int(v[0]),
+        "abre":   float(v[1]),
+        "max":    float(v[2]),
+        "min":    float(v[3]),
+        "cierra": float(v[4]),
+        "vol":    float(v[5]),
+        "ops":    int(v[8]),
+        "vol_comprador": float(v[9]),
+    } for v in velas]
+
+
+def precio_actual(simbolo):
+    d = pedir(f"{BINANCE}/api/v3/ticker/price", params={"symbol": simbolo}, timeout=15)
+    return float(d["price"])
+
+
+# ─────────────────────────────────────────────────────────────────────
+# CÁLCULO DE ZONAS
+# ─────────────────────────────────────────────────────────────────────
+
+def atr(velas, periodo=14):
+    """Rango medio verdadero: cuánto se mueve este activo de normal."""
+    rangos = []
+    for i in range(1, len(velas)):
+        a, b = velas[i - 1], velas[i]
+        rangos.append(max(
+            b["max"] - b["min"],
+            abs(b["max"] - a["cierra"]),
+            abs(b["min"] - a["cierra"]),
+        ))
+    if not rangos:
+        return 0.0
+    return sum(rangos[-periodo:]) / min(periodo, len(rangos))
+
+
+def buscar_giros(velas, umbral):
+    """
+    Zigzag sobre máximos y mínimos REALES de cada vela.
+    Un giro se confirma cuando el precio retrocede más de `umbral` desde
+    el extremo. Devuelve (índice, precio, 'techo'|'suelo').
+    """
+    giros = []
+    if len(velas) < 3:
+        return giros
+
+    direccion = 1          # 1 = buscando techo, -1 = buscando suelo
+    ext_i, ext_p = 0, velas[0]["max"]
+
+    for i, v in enumerate(velas):
+        if direccion == 1:
+            if v["max"] > ext_p:
+                ext_i, ext_p = i, v["max"]
+            elif ext_p - v["min"] > umbral:
+                giros.append((ext_i, ext_p, "techo"))
+                direccion, ext_i, ext_p = -1, i, v["min"]
+        else:
+            if v["min"] < ext_p:
+                ext_i, ext_p = i, v["min"]
+            elif v["max"] - ext_p > umbral:
+                giros.append((ext_i, ext_p, "suelo"))
+                direccion, ext_i, ext_p = 1, i, v["max"]
+
+    return giros
+
+
+def construir_zonas(velas, simbolo):
+    """
+    De los giros saca las zonas, y le pone a cada una su FUERZA,
+    que es la suma de sus toques pesados por volumen y envejecidos.
+    """
+    if len(velas) < 50:
+        return []
+
+    a = atr(velas)
+    if a <= 0:
+        return []
+
+    medio_ancho = a * ANCHO_ZONA_ATR
+    giros = buscar_giros(velas, a * GIRO_MINIMO_ATR)
+    if not giros:
+        return []
+
+    vol_tipico = statistics.median(v["vol"] for v in velas) or 1.0
+    ahora_ms = velas[-1]["t"]
+
+    zonas = []
+    for idx, precio, tipo in sorted(giros, key=lambda g: g[1]):
+        v = velas[idx]
+
+        # PESO DEL TOQUE: manda el volumen (lo que pidió Charlie)
+        peso_vol = min(v["vol"] / vol_tipico, 5.0)      # tope para que un pico no lo domine todo
+
+        # y envejece: un toque viejo pesa menos
+        dias = (ahora_ms - v["t"]) / 86_400_000
+        peso_edad = 0.5 ** (dias / VIDA_MEDIA_DIAS)
+
+        peso = peso_vol * peso_edad
+
+        # ¿quién mandaba en ese toque? (comprador agresivo vs resto)
+        prop_compra = v["vol_comprador"] / v["vol"] if v["vol"] else 0.5
+
+        if zonas and abs(precio - zonas[-1]["centro"]) <= medio_ancho * 2:
+            z = zonas[-1]
+            z["precios"].append(precio)
+            z["pesos"].append(peso)
+            z["tipos"].append(tipo)
+            z["compra"].append(prop_compra)
+            z["fechas"].append(v["t"])
+            z["centro"] = sum(z["precios"]) / len(z["precios"])
+        else:
+            zonas.append({
+                "centro": precio, "precios": [precio], "pesos": [peso],
+                "tipos": [tipo], "compra": [prop_compra], "fechas": [v["t"]],
+            })
+
+    for z in zonas:
+        z["simbolo"] = simbolo
+        z["ancho"] = medio_ancho
+        z["atr"] = a
+        z["fuerza"] = sum(z["pesos"])
+        z["toques"] = len(z["precios"])
+        z["toques_techo"] = z["tipos"].count("techo")
+        z["toques_suelo"] = z["tipos"].count("suelo")
+        z["dominio_compra"] = sum(z["compra"]) / len(z["compra"])
+        z["primer_toque"] = min(z["fechas"])
+        z["ultimo_toque"] = max(z["fechas"])
+        z["id"] = f"{simbolo}:{z['centro']:.6f}"
+        z["ultimo_aviso"] = 0.0
+        z["estado"] = "fuera"
+        z["entrada"] = None
+        z["ultimo_lado"] = None
+
+    umbral = umbral_de(simbolo)
+    fuertes = [z for z in zonas if z["fuerza"] >= umbral]
+    fuertes.sort(key=lambda z: -z["fuerza"])
+    return fuertes
+
+
+def papel(zona, precio):
+    """Si el precio está por debajo, la zona le hace de techo. Y al revés."""
+    return "resistencia" if precio < zona["centro"] else "soporte"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# REGISTRO DE SEÑALES  (lo nuevo)
+# ─────────────────────────────────────────────────────────────────────
+
+def radiografia_vela(v, vol_tipico):
+    """Todo lo que se puede decir de una vela: cuerpo, mechas, quién mandaba."""
+    rango = v["max"] - v["min"]
+    cuerpo = v["cierra"] - v["abre"]
+    return {
+        "hora_utc": iso(v["t"] / 1000),
+        "apertura": r6(v["abre"]),
+        "maximo": r6(v["max"]),
+        "minimo": r6(v["min"]),
+        "cierre": r6(v["cierra"]),
+        "color": "verde" if cuerpo > 0 else ("roja" if cuerpo < 0 else "doji"),
+        "rango": r6(rango),
+        "cuerpo": r6(cuerpo),
+        "cuerpo_pct_rango": r6(abs(cuerpo) / rango) if rango else None,
+        "mecha_superior": r6(v["max"] - max(v["abre"], v["cierra"])),
+        "mecha_inferior": r6(min(v["abre"], v["cierra"]) - v["min"]),
+        "volumen": r6(v["vol"]),
+        "volumen_comprador": r6(v["vol_comprador"]),
+        "dominio_comprador": r6(v["vol_comprador"] / v["vol"]) if v["vol"] else None,
+        "volumen_relativo": r6(v["vol"] / vol_tipico) if vol_tipico else None,
+        "operaciones": v["ops"],
+    }
+
+
+def velas_del_momento(simbolo, t_entrada, t_juicio):
+    """
+    Trae velas finas alrededor de la señal y devuelve:
+      · la vela en la que el precio ENTRÓ en la zona
+      · la vela en la que se JUZGÓ la reacción
+      · el resumen del tramo entre las dos
+    """
+    try:
+        velas = traer_velas(simbolo, VELA_REGISTRO, 60)
+    except Exception as e:
+        log(f"No pude traer velas de registro de {simbolo}: {e}")
+        return None, None, None
+
+    if not velas:
+        return None, None, None
+
+    vol_tipico = statistics.median(v["vol"] for v in velas) or 1.0
+
+    def mas_cercana(ts):
+        objetivo = ts * 1000
+        return min(velas, key=lambda v: abs(v["t"] - objetivo))
+
+    v_ent = mas_cercana(t_entrada)
+    v_jui = mas_cercana(t_juicio)
+
+    tramo = [v for v in velas if v_ent["t"] <= v["t"] <= v_jui["t"]] or [v_jui]
+    resumen = {
+        "velas": len(tramo),
+        "maximo": r6(max(v["max"] for v in tramo)),
+        "minimo": r6(min(v["min"] for v in tramo)),
+        "volumen_total": r6(sum(v["vol"] for v in tramo)),
+        "dominio_comprador": r6(
+            sum(v["vol_comprador"] for v in tramo) / sum(v["vol"] for v in tramo)
+        ) if sum(v["vol"] for v in tramo) else None,
+        "verdes": sum(1 for v in tramo if v["cierra"] > v["abre"]),
+        "rojas": sum(1 for v in tramo if v["cierra"] < v["abre"]),
+    }
+
+    return (radiografia_vela(v_ent, vol_tipico),
+            radiografia_vela(v_jui, vol_tipico),
+            resumen)
+
+
+def construir_registro(simbolo, zona, resultado, precio, ahora, texto):
+    """Arma el JSON completo de una señal."""
+    tipo = resultado[0]
+    entrada = zona.get("entrada") or {}
+
+    reg = {
+        "id": f"{simbolo}-{int(ahora)}",
+        "hora_utc": iso(ahora),
+        "simbolo": simbolo,
+        "activo": simbolo.replace("USDT", ""),
+        "tipo": tipo,                                  # rebote | cruce
+        "sentido": resultado[1],                       # alcista/bajista | arriba/abajo
+        "papel_previo": entrada.get("papel"),          # qué hacía la zona antes
+        "lado_entrada": entrada.get("lado"),
+        "precio_señal": r6(precio),
+        "hora_entrada_zona_utc": iso(entrada["t"]) if entrada.get("t") else None,
+        "minutos_espera": ESPERA_MINUTOS,
+        "zona": {
+            "id": zona["id"],
+            "centro": r6(zona["centro"]),
+            "ancho": r6(zona["ancho"]),
+            "borde_inferior": r6(zona["centro"] - zona["ancho"]),
+            "borde_superior": r6(zona["centro"] + zona["ancho"]),
+            "fuerza": r6(zona["fuerza"]),
+            "umbral_aplicado": r6(umbral_de(simbolo)),
+            "toques": zona["toques"],
+            "toques_techo": zona.get("toques_techo"),
+            "toques_suelo": zona.get("toques_suelo"),
+            "dominio_compra": r6(zona["dominio_compra"]),
+            "atr": r6(zona.get("atr")),
+            "primer_toque_utc": iso(zona["primer_toque"] / 1000) if zona.get("primer_toque") else None,
+            "ultimo_toque_utc": iso(zona["ultimo_toque"] / 1000) if zona.get("ultimo_toque") else None,
+        },
+        "mensaje": texto.replace("\n", " | "),
+        "seguimiento": {},
+    }
+
+    v_ent, v_jui, tramo = velas_del_momento(
+        simbolo, entrada.get("t", ahora), ahora)
+    reg["vela_entrada"] = v_ent
+    reg["vela_señal"] = v_jui
+    reg["tramo_espera"] = tramo
+
+    return reg
+
+
+def guardar_registro(reg):
+    """Lo deja en el log siempre, y en la hoja si hay URL configurada."""
+    print("SEÑAL_JSON " + json.dumps(reg, ensure_ascii=False), flush=True)
+    if not REGISTRO_URL:
+        return
+    try:
+        pedir(REGISTRO_URL, datos=reg, timeout=20)
+    except Exception as e:
+        log(f"No pude escribir el registro en la hoja: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# VIGILANCIA
+# ─────────────────────────────────────────────────────────────────────
+
+def describir(zona):
+    fuerza = zona["fuerza"]
+    umbral = umbral_de(zona["simbolo"])
+    etiqueta = "MUY FUERTE" if fuerza >= umbral * 2 else "fuerte"
+    mandaban = "compradores" if zona["dominio_compra"] > 0.55 else \
+               "vendedores" if zona["dominio_compra"] < 0.45 else "reparto"
+    return f"zona {etiqueta}: {zona['toques']} toques, {mandaban} mandando"
+
+
+def revisar(zona, precio, ahora):
+    """
+    Máquina de estados de una zona:
+      fuera  → el precio entra en la zona → esperando
+      esperando → pasados ESPERA_MINUTOS se juzga: rebote o cruce
+    """
+    dentro = abs(precio - zona["centro"]) <= zona["ancho"]
+
+    # Mientras está claramente fuera, vamos apuntando de qué lado está.
+    # Ese es el lado del que VIENE cuando entre — dentro de la zona ya no
+    # se puede saber, y era el fallo de la primera versión.
+    if not dentro:
+        zona["ultimo_lado"] = "abajo" if precio < zona["centro"] else "arriba"
+
+    if zona["estado"] == "fuera":
+        if dentro:
+            # si aún no sabemos de dónde venía (recién arrancado el bot),
+            # no juzgamos este toque: esperamos al siguiente
+            if not zona.get("ultimo_lado"):
+                return None
+            zona["estado"] = "esperando"
+            zona["entrada"] = {
+                "t": ahora,
+                "lado": zona["ultimo_lado"],
+                "papel": "resistencia" if zona["ultimo_lado"] == "abajo" else "soporte",
+            }
+        return None
+
+    if zona["estado"] == "esperando":
+        if ahora - zona["entrada"]["t"] < ESPERA_MINUTOS * 60:
+            return None                      # todavía esperando reacción
+
+        lado_antes = zona["entrada"]["lado"]
+        lado_ahora = "abajo" if precio < zona["centro"] - zona["ancho"] else \
+                     "arriba" if precio > zona["centro"] + zona["ancho"] else "dentro"
+        zona["estado"] = "fuera"
+
+        if lado_ahora == "dentro":
+            return None                      # ni una cosa ni la otra, no molestamos
+
+        if lado_ahora == lado_antes:
+            sentido = "bajista" if lado_antes == "abajo" else "alcista"
+            return ("rebote", sentido, zona["entrada"]["papel"])
+
+        return ("cruce", lado_ahora, zona["entrada"]["papel"])
+
+    return None
+
+
+def revisar_seguimientos(pendientes, ahora):
+    """
+    Rellena el precio a +1h, +4h y +24h de cada señal ya emitida,
+    que es lo que convierte el registro en estadística.
+    """
+    quedan = []
+    for p in pendientes:
+        objetivos = [o for o in p["objetivos"] if o["cuando"] > ahora]
+        vencidos = [o for o in p["objetivos"] if o["cuando"] <= ahora]
+
+        for o in vencidos:
+            try:
+                precio = precio_actual(p["simbolo"])
+            except Exception as e:
+                log(f"Seguimiento {p['reg']['id']}: no pude leer precio ({e})")
+                objetivos.append(o)          # se reintenta en la vuelta siguiente
+                continue
+
+            base = p["reg"]["precio_señal"]
+            p["reg"]["seguimiento"][o["clave"]] = {
+                "precio": r6(precio),
+                "variacion_pct": r6((precio - base) / base * 100) if base else None,
+                "hora_utc": iso(ahora),
+            }
+            log(f"Seguimiento {o['clave']} de {p['reg']['id']}: {precio}")
+            guardar_registro(p["reg"])
+
+        p["objetivos"] = objetivos
+        if objetivos:
+            quedan.append(p)
+
+    return quedan
+
+
+def main():
+    log("Vigía de zonas arrancando.")
+    log(f"Activos: {', '.join(SIMBOLOS)} | espera {ESPERA_MINUTOS} min")
+    for s in SIMBOLOS:
+        log(f"   umbral de {s}: {umbral_de(s)}")
+    log(f"Registro en hoja: {'SÍ' if REGISTRO_URL else 'no (solo log)'}")
+
+    zonas = {}
+    pendientes = []
+    ultimo_calculo = 0.0
+
+    while True:
+        ahora = time.time()
+
+        # Recalcular zonas de vez en cuando (y al arrancar)
+        if ahora - ultimo_calculo > RECALCULO_HORAS * 3600:
+            for s in SIMBOLOS:
+                try:
+                    velas = traer_velas(s, "1h", 2000)
+                    zonas[s] = construir_zonas(velas, s)
+                    log(f"{s}: {len(velas)} velas, {len(zonas[s])} zonas fuertes "
+                        f"(umbral {umbral_de(s)})")
+                    for z in zonas[s][:6]:
+                        log(f"    {fmt(z['centro'], s)}  fuerza {z['fuerza']:.1f}  "
+                            f"{z['toques']} toques")
+                except Exception as e:
+                    log(f"Error calculando zonas de {s}: {e}")
+            ultimo_calculo = ahora
+
+        # Mirar el precio contra las zonas
+        for s in SIMBOLOS:
+            try:
+                p = precio_actual(s)
+            except Exception as e:
+                log(f"No pude leer el precio de {s}: {e}")
+                continue
+
+            for z in zonas.get(s, []):
+                r = revisar(z, p, ahora)
+                if not r:
+                    continue
+                if ahora - z["ultimo_aviso"] < SILENCIO_HORAS * 3600:
+                    continue
+
+                tipo = r[0]
+                activo = s.replace("USDT", "")
+                nivel = fmt(z["centro"], s)
+
+                if tipo == "rebote":
+                    _, sentido, pap = r
+                    texto = (f"{activo} — rebote {sentido} en {nivel}\n"
+                             f"{describir(z)}\n"
+                             f"Vigila gráfica.")
+                else:
+                    _, hacia, pap = r
+                    que = "resistencia" if pap == "resistencia" else "soporte"
+                    texto = (f"{activo} — cruza {que} de {nivel}\n"
+                             f"{describir(z)}\n"
+                             f"Ahora esa zona pasa a hacer de "
+                             f"{'soporte' if que == 'resistencia' else 'resistencia'}. "
+                             f"Vigila gráfica.")
+
+                log("AVISO -> " + texto.replace("\n", " | "))
+                telegram(texto)
+                z["ultimo_aviso"] = ahora
+
+                # ── registro completo de la señal ──
+                try:
+                    reg = construir_registro(s, z, r, p, ahora, texto)
+                    guardar_registro(reg)
+                    pendientes.append({
+                        "simbolo": s,
+                        "reg": reg,
+                        "objetivos": [
+                            {"clave": f"mas_{h:g}h", "cuando": ahora + h * 3600}
+                            for h in SEGUIMIENTOS_H
+                        ],
+                    })
+                except Exception as e:
+                    log(f"Error construyendo el registro: {e}")
+
+        # Rellenar los seguimientos que toquen
+        try:
+            pendientes = revisar_seguimientos(pendientes, ahora)
+        except Exception as e:
+            log(f"Error en seguimientos: {e}")
+
+        time.sleep(INTERVALO_SEGUNDOS)
+
+
+if __name__ == "__main__":
+    main()
