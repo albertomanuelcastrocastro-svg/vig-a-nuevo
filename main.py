@@ -77,8 +77,22 @@ REGISTRO_URL = os.getenv("REGISTRO_URL", "")
 # Vela fina que se usa para radiografiar el momento de la señal
 VELA_REGISTRO = os.getenv("VELA_REGISTRO", "5m")
 
-# Horas a las que se mira qué pasó después de cada señal
-SEGUIMIENTOS_H = [float(x) for x in os.getenv("SEGUIMIENTOS_H", "1,4,24").split(",")]
+# El seguimiento se cuenta en VELAS, no en horas: se mira qué hace el precio
+# en las N velas siguientes a la señal, en la temporalidad con la que se
+# calculan las zonas. Así la ventana se ajusta sola a cada activo.
+TF_SENAL = os.getenv("TF_SENAL", "1h")
+VENTANAS_VELAS = [int(x) for x in os.getenv("VENTANAS_VELAS", "5,10,15").split(",")]
+
+_MIN_TF = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
+
+# Vela fina con la que se reconstruye el recorrido posterior a la señal.
+# Se usan sus máximos y mínimos, así que el peor y el mejor momento salen exactos.
+VELA_RECORRIDO = os.getenv("VELA_RECORRIDO", "5m")
+
+# Simulación: stop y objetivo, medidos en ATR (la vara de la casa).
+# Con esto se sabe si la señal era OPERABLE, no solo si acertaba.
+SL_ATR = float(os.getenv("SL_ATR", "1.0"))
+TP_ATR = float(os.getenv("TP_ATR", "2.0"))
 
 BINANCE = "https://api.binance.com"
 
@@ -178,6 +192,29 @@ def traer_velas(simbolo, intervalo="1h", total=2000):
 def precio_actual(simbolo):
     d = pedir(f"{BINANCE}/api/v3/ticker/price", params={"symbol": simbolo}, timeout=15)
     return float(d["price"])
+
+
+def traer_rango(simbolo, intervalo, inicio_ms, fin_ms):
+    """Velas entre dos instantes, en orden. Para reconstruir el recorrido."""
+    velas = []
+    cursor = inicio_ms
+    while cursor < fin_ms and len(velas) < 2000:
+        lote = pedir(f"{BINANCE}/api/v3/klines", params={
+            "symbol": simbolo, "interval": intervalo,
+            "startTime": int(cursor), "endTime": int(fin_ms), "limit": 1000,
+        })
+        if not lote:
+            break
+        velas += lote
+        cursor = lote[-1][0] + 1
+        if len(lote) < 1000:
+            break
+        time.sleep(0.25)
+
+    return [{
+        "t": int(v[0]), "abre": float(v[1]), "max": float(v[2]),
+        "min": float(v[3]), "cierra": float(v[4]), "vol": float(v[5]),
+    } for v in velas]
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -378,6 +415,105 @@ def velas_del_momento(simbolo, t_entrada, t_juicio):
             resumen)
 
 
+def direccion_de(sentido):
+    """+1 si la señal apunta hacia arriba, -1 si apunta hacia abajo."""
+    return 1 if sentido in ("alcista", "arriba") else -1
+
+
+def analizar_recorrido(simbolo, t_senal, precio0, direccion, atr, t_hasta):
+    """
+    Reconstruye qué hizo el precio DESPUÉS de la señal, hasta t_hasta.
+
+    Lo que de verdad hace falta para saber si una señal es operable:
+      · a_favor   — lo máximo que llegó a moverse hacia donde avisaba
+      · en_contra — lo máximo que se fue al lado contrario por el camino
+      · y la simulación de stop/objetivo: cuál de los dos habría saltado primero
+
+    Sin el "en contra", una señal que acaba acertando parece buena aunque te
+    hubiera sacado por el stop antes de llegar. Acertar y ser operable no es
+    lo mismo, y esto separa las dos cosas.
+    """
+    velas = traer_rango(simbolo, VELA_RECORRIDO,
+                        int(t_senal * 1000), int(t_hasta * 1000))
+    if not velas or not precio0:
+        return None
+
+    mejor = peor = 0.0            # extremos a favor y en contra
+    t_mejor = t_peor = None       # cuándo ocurrió cada uno
+    favor_antes_del_peor = 0.0    # ¿llegó a ir a favor y lo devolvió?
+    contra_antes_del_mejor = 0.0  # ¿cuánto dolor hubo que aguantar antes del premio?
+    corre_favor = corre_contra = 0.0
+
+    nivel_tp = precio0 + direccion * TP_ATR * atr if atr else None
+    nivel_sl = precio0 - direccion * SL_ATR * atr if atr else None
+    desenlace, t_desenlace = "abierta", None
+
+    for v in velas:
+        if direccion > 0:
+            favor_v, contra_v = v["max"] - precio0, precio0 - v["min"]
+            toca_tp = nivel_tp is not None and v["max"] >= nivel_tp
+            toca_sl = nivel_sl is not None and v["min"] <= nivel_sl
+        else:
+            favor_v, contra_v = precio0 - v["min"], v["max"] - precio0
+            toca_tp = nivel_tp is not None and v["min"] <= nivel_tp
+            toca_sl = nivel_sl is not None and v["max"] >= nivel_sl
+
+        if favor_v > mejor:
+            mejor, t_mejor = favor_v, v["t"] / 1000
+            contra_antes_del_mejor = corre_contra
+        if contra_v > peor:
+            peor, t_peor = contra_v, v["t"] / 1000
+            favor_antes_del_peor = corre_favor
+
+        corre_favor = max(corre_favor, favor_v)
+        corre_contra = max(corre_contra, contra_v)
+
+        if desenlace == "abierta" and (toca_tp or toca_sl):
+            # Si en la MISMA vela caben los dos, se cuenta el stop. No se puede
+            # saber el orden dentro de una vela, así que se tira por lo prudente.
+            desenlace = "SL" if toca_sl else "TP"
+            t_desenlace = v["t"] / 1000
+
+    cierre = velas[-1]["cierra"]
+    neto = (cierre - precio0) * direccion
+
+    def en_atr(x):
+        return r6(x / atr) if atr else None
+
+    def min_desde(t):
+        return r6((t - t_senal) / 60) if t else None
+
+    # ¿qué pasó primero, el susto o el premio?
+    if t_mejor and t_peor:
+        primero = "a_favor" if t_mejor < t_peor else "en_contra"
+    else:
+        primero = "a_favor" if t_mejor else ("en_contra" if t_peor else None)
+
+    return {
+        "velas": len(velas),
+        "a_favor":   {"precio": r6(mejor), "pct": r6(mejor / precio0 * 100),
+                      "atr": en_atr(mejor), "minutos": min_desde(t_mejor)},
+        "en_contra": {"precio": r6(peor),  "pct": r6(peor / precio0 * 100),
+                      "atr": en_atr(peor),  "minutos": min_desde(t_peor)},
+        "cierre":    {"precio": r6(cierre), "pct": r6(neto / precio0 * 100),
+                      "atr": en_atr(neto)},
+        "forma": {
+            "primero": primero,
+            # lo que hubo que aguantar en contra ANTES de llegar al mejor momento.
+            # Es el número que dice si la señal se podía sostener o no.
+            "contra_antes_del_mejor_atr": en_atr(contra_antes_del_mejor),
+            # si esto es alto, la señal fue a favor, se dio la vuelta y te la devolvió
+            "favor_antes_del_peor_atr": en_atr(favor_antes_del_peor),
+        },
+        "simulacion": {
+            "sl_atr": SL_ATR, "tp_atr": TP_ATR,
+            "nivel_sl": r6(nivel_sl), "nivel_tp": r6(nivel_tp),
+            "desenlace": desenlace,
+            "minutos_hasta": min_desde(t_desenlace),
+        },
+    }
+
+
 def construir_registro(simbolo, zona, resultado, precio, ahora, texto):
     """Arma el JSON completo de una señal."""
     tipo = resultado[0]
@@ -390,6 +526,7 @@ def construir_registro(simbolo, zona, resultado, precio, ahora, texto):
         "activo": simbolo.replace("USDT", ""),
         "tipo": tipo,                                  # rebote | cruce
         "sentido": resultado[1],                       # alcista/bajista | arriba/abajo
+        "direccion": direccion_de(resultado[1]),       # +1 arriba · -1 abajo
         "papel_previo": entrada.get("papel"),          # qué hacía la zona antes
         "lado_entrada": entrada.get("lado"),
         "precio_señal": r6(precio),
@@ -499,8 +636,9 @@ def revisar(zona, precio, ahora):
 
 def revisar_seguimientos(pendientes, ahora):
     """
-    Rellena el precio a +1h, +4h y +24h de cada señal ya emitida,
-    que es lo que convierte el registro en estadística.
+    A la hora, a las 4 y a las 24 reconstruye el recorrido de cada señal:
+    cuánto se fue a favor, cuánto en contra, y si habría saltado antes el
+    stop o el objetivo. Esto es lo que convierte el registro en estadística.
     """
     quedan = []
     for p in pendientes:
@@ -508,21 +646,30 @@ def revisar_seguimientos(pendientes, ahora):
         vencidos = [o for o in p["objetivos"] if o["cuando"] <= ahora]
 
         for o in vencidos:
+            reg = p["reg"]
             try:
-                precio = precio_actual(p["simbolo"])
+                rec = analizar_recorrido(
+                    p["simbolo"], p["t_senal"], reg["precio_señal"],
+                    reg["direccion"], (reg["zona"] or {}).get("atr"), o["cuando"])
             except Exception as e:
-                log(f"Seguimiento {p['reg']['id']}: no pude leer precio ({e})")
+                log(f"Seguimiento {reg['id']}: no pude reconstruir el recorrido ({e})")
                 objetivos.append(o)          # se reintenta en la vuelta siguiente
                 continue
 
-            base = p["reg"]["precio_señal"]
-            p["reg"]["seguimiento"][o["clave"]] = {
-                "precio": r6(precio),
-                "variacion_pct": r6((precio - base) / base * 100) if base else None,
-                "hora_utc": iso(ahora),
-            }
-            log(f"Seguimiento {o['clave']} de {p['reg']['id']}: {precio}")
-            guardar_registro(p["reg"])
+            if not rec:
+                objetivos.append(o)
+                continue
+
+            rec["hora_utc"] = iso(ahora)
+            reg["seguimiento"][o["clave"]] = rec
+
+            log(f"Seguimiento {o['clave']} de {reg['id']}: "
+                f"a favor {rec['a_favor']['atr']} ATR · "
+                f"en contra {rec['en_contra']['atr']} ATR · "
+                f"primero {rec['forma']['primero']} · "
+                f"aguantar {rec['forma']['contra_antes_del_mejor_atr']} ATR · "
+                f"{rec['simulacion']['desenlace']}")
+            guardar_registro(reg)
 
         p["objetivos"] = objetivos
         if objetivos:
@@ -537,6 +684,9 @@ def main():
     for s in SIMBOLOS:
         log(f"   umbral de {s}: {umbral_de(s)}")
     log(f"Registro en hoja: {'SÍ' if REGISTRO_URL else 'no (solo log)'}")
+    log(f"Seguimiento: {VENTANAS_VELAS} velas de {TF_SENAL} tras cada senal")
+    log(f"Simulacion: stop {SL_ATR} ATR · objetivo {TP_ATR} ATR · "
+        f"recorrido medido con velas de {VELA_RECORRIDO}")
 
     zonas = {}
     pendientes = []
@@ -604,9 +754,11 @@ def main():
                     pendientes.append({
                         "simbolo": s,
                         "reg": reg,
+                        "t_senal": ahora,
                         "objetivos": [
-                            {"clave": f"mas_{h:g}h", "cuando": ahora + h * 3600}
-                            for h in SEGUIMIENTOS_H
+                            {"clave": f"{n}velas",
+                             "cuando": ahora + n * _MIN_TF.get(TF_SENAL, 60) * 60}
+                            for n in VENTANAS_VELAS
                         ],
                     })
                 except Exception as e:
